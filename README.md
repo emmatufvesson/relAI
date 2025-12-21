@@ -1,99 +1,205 @@
-# Vision service + Coral på Raspberry Pi 5 (Docker) — logg & status
+# relAI på Raspberry Pi 5 — statuslogg & körbart nuläge (video+audio+HA)
 
-Det här repo:t dokumenterar hur vi fick igång lokal bild-inferens på en **Raspberry Pi 5** med en **USB-webbkamera** och **Google Coral USB (EdgeTPU)**, där inferensen körs i **Docker** och exponeras via en liten **FastAPI**-tjänst.
+Det här repo:t dokumenterar vårt faktiska “nu-läge” på Raspberry Pi 5:
+- **Video-inferens med Google Coral (EdgeTPU)** i Docker (pycoral/apt på bullseye pga kompatibilitet).
+- **Audio capture från webbkamera (UGREEN USB Audio)** → enkel realtids-score (dBFS/energi) → skickas till en HTTP-endpoint.
+- **Home Assistant** körs som Docker-container (för framtida dashboard/automationer/Assist i mobilen).
+- En superminimal **dashboard-endpoint** (FastAPI mini) användes för att verifiera att ljudloopen kan skicka A/B live.
 
-Målet var att vara realistiska och verifiera allt i terminalen (ingen gissning, inga hittepåsiffror).
+Målet är att bygga upp systemet stegvis, med verifierbara terminalkommandon och så lite gissning som möjligt.
 
 ---
 
 ## Miljö (verifierat)
 
 **Host:**
-- Raspberry Pi 5 Model B Rev 1.0
+- Raspberry Pi 5 Model B
 - OS: Debian GNU/Linux 12 (bookworm)
-- Kernel: `6.6.51+rpt-rpi-2712` (aarch64)
-- RAM: 4.0 GiB
-- Kamera: UGREEN Camera (UVC)
-- Ljud: USB Audio från kameran
+- CPU/arch: aarch64
+- Kamera: UGREEN UVC + USB Audio (mic)
 
-**Enheter:**
-- Video-noder: `/dev/video0` och `/dev/video1` (UGREEN Camera)
-- Audio capture: `card 0: Camera [UGREEN Camera], device 0: USB Audio`
-- Coral USB syns i `lsusb` som:
-  - `18d1:9302 Google Inc.` (EdgeTPU aktiv)
+**Audio (UGREEN Camera)**
+- `arecord -l`:
+  - `card 0: Camera [UGREEN Camera], device 0: USB Audio [USB Audio]`
+- `--dump-hw-params` visar:
+  - FORMAT: `S16_LE`
+  - CHANNELS: `2`
+  - RATE: `[8000 48000]`
 
----
-
-## Viktiga insikter vi bekräftade
-
-### 1) Kameran fungerar för både bild och ljud
-- `v4l2-ctl` visade att kameran stödjer MJPG 1080p upp till 30 fps.
-- `arecord` kunde spela in en test-wav (16kHz mono).
-
-### 2) EdgeTPU runtime finns på host
-- `libedgetpu.so.1` finns i `/usr/lib/aarch64-linux-gnu/`.
-- Vi såg att `load_delegate("libedgetpu.so.1")` fungerade med `sudo` först.
-- Vi satte upp udev-regel + grupp så att delegate kunde laddas utan sudo.
-
-### 3) Docker installerades och körs
-- `docker run --rm hello-world` fungerade.
-- `docker-compose` (v1) finns installerat.
-
-### 4) PyCoral på Debian Bookworm + Python 3.11 i container är struligt
-- Försök att installera `python3-pycoral` i en Bookworm/Python 3.11-container failade:
-  - `python3-pycoral` kräver `python3 < 3.10` och en specifik `python3-tflite-runtime`.
-- Lösningen blev att bygga en container baserad på **Debian bullseye-slim** (Python ~3.9 via apt),
-  så att `python3-pycoral` och EdgeTPU runtime kan installeras via apt.
+**Coral**
+- syns som `18d1:9302` i `lsusb` (EdgeTPU aktiv)
 
 ---
 
-## Docker images vi använde
+## Repo-mappar (lokalt på Pi)
 
-- `coral-test:py39`  
-  En testimage där vi kunde köra TFLite + EdgeTPU och testa modeller.
-
-- `vision-service:coral-apt`  
-  En FastAPI-tjänst byggd på bullseye-slim + apt-install av `python3-pycoral` och `libedgetpu1-std`.
-
----
-
-## Problem vi stötte på och hur de löstes
-
-### A) FastAPI kraschade vid file upload
-Fel:
-- `Form data requires "python-multipart" to be installed.`
-
-Fix:
-- Installera `python-multipart` i imagen (pip i containern).
-
-### B) "Empty reply from server" på /infer
-Orsak:
-- Tjänsten dog (segfault/exit 139) eller gav non-JSON.
-- I vår pipeline var den vanligaste orsaken först att servern försökte mata in originalbildens storlek till modellen.
-
-Fix:
-- Resiza bilden till modellens input innan `common.set_input(...)`.
-  (SSD Mobilenet v2 vill ha 300x300.)
-
-### C) Input shape mismatch i pycoral
-Fel:
-- `ValueError: could not broadcast input array from shape (...) into shape (300,300,3)`
-
-Fix:
-- `w, h = common.input_size(interpreter)` och `img = img.resize((w,h))`
+Exempelstruktur (kan variera lite):
+- `~/vision_service/` eller `~/vision_service_bookworm/` – vision/Coral-relaterat
+- `~/coral-test-data/` – modeller/testdata
+- `~/relai-audio-loop/` – audio loop (ffmpeg → dBFS-score → /set)
+- `~/relai-dashboard-mini/` – minimal FastAPI endpoint för att ta emot /set (användes för test)
+- `~/homeassistant/config/` – Home Assistant config-volym
 
 ---
 
-## Verifierat fungerande: /health + /infer
+## 1) Home Assistant (Docker) — igång
 
-### Starta tjänsten
-Kör i terminal 1:
-
+### Starta Home Assistant container
 ```bash
-docker run --rm -it \
-  --name vision-service \
-  -p 5052:5052 \
-  --device /dev/bus/usb:/dev/bus/usb \
-  -v ~/coral-test-data:/models:ro \
-  -e MODEL_PATH=/models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite \
-  vision-service:coral-apt
+mkdir -p ~/homeassistant/config
+
+docker run -d \
+  --name homeassistant \
+  --restart=unless-stopped \
+  --network=host \
+  -e TZ="Europe/Stockholm" \
+  -v ~/homeassistant/config:/config \
+  ghcr.io/home-assistant/home-assistant:stable
+(Valfritt) Om du vill ha Bluetooth-stöd i HA-container
+Du kan skapa om containern med:
+
+--cap-add=NET_ADMIN --cap-add=NET_RAW
+
+och mount av dbus: -v /run/dbus:/run/dbus:ro
+
+Exempel:
+
+bash
+Kopiera kod
+sudo apt update
+sudo apt install -y bluez
+
+docker stop homeassistant
+docker rm homeassistant
+
+docker run -d \
+  --name homeassistant \
+  --restart=unless-stopped \
+  --network=host \
+  --cap-add=NET_ADMIN \
+  --cap-add=NET_RAW \
+  -v /run/dbus:/run/dbus:ro \
+  -e TZ="Europe/Stockholm" \
+  -v ~/homeassistant/config:/config \
+  ghcr.io/home-assistant/home-assistant:stable
+Öppna HA UI
+Ta Pi-IP:
+
+bash
+Kopiera kod
+hostname -I
+Öppna i webbläsare (mobil/dator på samma nät):
+
+http://<PI-IP>:8123
+
+Röst (nivå 2)
+Installera Home Assistant Companion App på mobilen.
+
+Logga in mot http://<PI-IP>:8123.
+
+Använd Assist i appen för röstkommandon.
+
+2) Audio loop (webbkamera-mic → score → HTTP)
+Förutsättningar
+bash
+Kopiera kod
+sudo apt update
+sudo apt install -y ffmpeg python3-venv
+Verifiera ljud-enheten
+bash
+Kopiera kod
+arecord -l
+arecord -D hw:0,0 --dump-hw-params -d 1 /dev/null
+Testa inspelning (uppspelning är valfritt)
+bash
+Kopiera kod
+arecord -D hw:0,0 -f S16_LE -c 2 -r 48000 -d 3 test.wav
+ls -lh test.wav
+Obs: aplay kan faila om Pi saknar playback-enhet. Det påverkar inte inspelning.
+
+Audio loop-körning
+Audio-loopen använder ffmpeg + ALSA och skickar A/B till /set:
+
+bash
+Kopiera kod
+cd ~/relai-audio-loop
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install requests
+
+ALSA_DEVICE="plughw:0,0" \
+DASHBOARD_SET_URL="http://127.0.0.1:8000/set" \
+python ./audio_loop_webcam.py
+Förväntat:
+
+Terminal acknowledges dBFS/score kontinuerligt.
+
+Inga “Connection refused” om mottagaren är igång.
+
+3) Minimal “dashboard-endpoint” (FastAPI) — testmottagare för /set
+Detta är inte Home Assistant-dashboards, utan ett enkelt sätt att bevisa att ljudloopen kan skicka data live.
+
+Skapa och starta mini-dashboard
+bash
+Kopiera kod
+mkdir -p ~/relai-dashboard-mini
+cd ~/relai-dashboard-mini
+python3 -m venv .venv
+source .venv/bin/activate
+pip install fastapi uvicorn
+
+cat > app.py <<'PY'
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+state = {"A": 0.0, "B": 0.0}
+
+@app.get("/health")
+def health():
+    return {"ok": True, "state": state}
+
+@app.get("/set")
+def set_values(A: float = 0.0, B: float = 0.0):
+    state["A"] = float(A)
+    state["B"] = float(B)
+    return JSONResponse({"ok": True, "state": state})
+PY
+
+uvicorn app:app --host 0.0.0.0 --port 8000
+Test:
+
+bash
+Kopiera kod
+curl "http://127.0.0.1:8000/health"
+curl "http://127.0.0.1:8000/set?A=0.5&B=0.2"
+4) Vision + Coral (Docker) — riktning
+PyCoral i Bookworm + Python 3.11 i container är struligt.
+Vi har därför kört en bullseye/py39-baserad container där pycoral och edgetpu-runtime installeras via apt.
+
+Grundprinciper som redan verifierats tidigare:
+
+Resiza alltid input till modellens input_size innan set_input(...) (t.ex. 300x300 för SSD Mobilenet v2).
+
+Kör container med --device /dev/bus/usb:/dev/bus/usb så EdgeTPU är synlig.
+
+(Detaljer ligger i vision_service-mapparna och tidigare logg.)
+
+Kända “gotchas”
+aplay fungerar inte
+Om Pi saknar playback-device får du fel, men inspelning + analys fungerar ändå.
+
+Bluetooth-varningar i HA logs
+Om du inte behöver Bluetooth: ignorera.
+Om du behöver Bluetooth: återskapa containern med NET_ADMIN/NET_RAW + dbus mount och installera bluez på host.
+
+Nästa steg (plan)
+Flytta A/B-score från mini-dashboard till Home Assistant som sensor (REST/command_line/MQTT).
+
+Bygga HA-dashboard som kan visas på mobil/dator (och senare kiosk på skärm).
+
+Skapa todo/workflow: Assist (mobil) → HA automation → todo/shopping list.
+
+Integrera vision-events (EdgeTPU detections) som HA-sensorer/events.
+
