@@ -1,6 +1,28 @@
+# Python
 __pycache__/
 *.pyc
-.env
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+venv/
+tpu-venv/
+
+# Audio/video artifacts
+*.wav
+*.mp3
+*.mp4
+*.mkv
+*.avi
+
+# Logs / temp
 *.log
-coral-test-data/
-coral-test-data/**
+*.tmp
+.cache/
+
+# Home Assistant: never commit runtime storage or secrets
+homeassistant/config/.storage/
+homeassistant/config/secrets.yaml
+homeassistant/config/*.db
+homeassistant/config/*.log
