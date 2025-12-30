@@ -26,3 +26,4 @@ homeassistant/config/.storage/
 homeassistant/config/secrets.yaml
 homeassistant/config/*.db
 homeassistant/config/*.log
+.relai_secrets
